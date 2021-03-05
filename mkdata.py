@@ -1,4 +1,5 @@
 #!/usr/local/bin/python3
+# pip3 install psycopg2-binary
 
 import psycopg2
 import random
@@ -12,24 +13,22 @@ import time
 import math
 from psycopg2.pool import ThreadedConnectionPool
 
-DSN = "postgresql://root@34.74.144.16:26257/test"
-max_concurrency = 200 #one thread per table is generated
+DSN = "postgresql://root@35.231.25.184:26257/test" #through LB
+#DSN = "postgresql://root@35.185.43.70:26257/test" #through one node
+
+max_concurrency = 96 #one thread per table is generated
 num_tables = 400 #num of tables to create
 num_fields = 15 #num of fields per table
-num_rows = 50000000 #num of rows per table; make sure this is evently divisible by the batchsize
-batchsize = 100 #number of inserts to do as a single statement
+num_rows = 50000 #num of rows per table; make sure this is evently divisible by the batchsize
+batchsize = 100 #number of inserts to do as a single transaction
 
 starttime = datetime.datetime.now()
-livethreads = 0
 numtablesdone = 0
 mybatches = 0
 totalbatches = num_tables * num_rows / batchsize
 
-def write_table(table_id):
-    global livethreads
-    global mybatches
-    livethreads = livethreads + 1
-       
+#create tables
+def mk_table(table_id):
     #build a table sql
     myquery = "CREATE TABLE IF NOT EXISTS table" + str(table_id).zfill(6) + " (field1 UUID PRIMARY KEY default gen_random_uuid(), field000002 INT"
     for i in range(1, num_fields - 2 + 1):
@@ -39,7 +38,7 @@ def write_table(table_id):
     myquery = myquery + ");"
 
     try: 
-        conn
+            conn
     except NameError: 
         conn = tcp.getconn()
         conn.autocommit = True
@@ -61,24 +60,11 @@ def write_table(table_id):
     else:       
         conn.commit()
     
-    try:
-        cursor
-    except NameError:
-        pass
-    else:
-        cursor.close()
+    teardown(cursor, conn)
 
-
-    try:
-        conn
-    except NameError:
-        pass
-    else:
-        tcp.putconn(conn, close=False)
-
-    
-
-    #build a one row insert and loop
+#write data to the table    
+def write_table(table_id):
+    global mybatches
 
     try: 
         conn2
@@ -125,9 +111,14 @@ def write_table(table_id):
             except Exception as err:
                 print("ERROR: " + str(myquery) + " " + str(err))
                 conn2.rollback()
+                print("Retrying " + str(table_id))
+                write_table(table_id)
             else:
                 conn2.commit()
-    
+    teardown(cursor2, conn2)
+
+#tear down a connect and return it to the pool
+def teardown(cursor, conn):
     try:
         cursor
     except NameError:
@@ -136,11 +127,11 @@ def write_table(table_id):
         cursor.close()
 
     try:
-        conn2
+        conn
     except NameError:
         pass
     else:
-        tcp.putconn(conn2, close=False)
+        tcp.putconn(conn, close=False)
 
 def tabledone(fn):
     global numtablesdone
@@ -151,18 +142,38 @@ def tabledone(fn):
         error = fn.exception()
         if error:
             print(str(fn) + ": error returned: " + str(error))
-            #livethreads = livethreads - 1
         else:
             #result = fn.result()
-            print(str(datetime.datetime.now()) + ": " + str(numtablesdone).zfill(6) + " Tables done. " )
+            #print(str(datetime.datetime.now()) + ": " + str(numtablesdone).zfill(6) + " Tables done. " )
+            pass
 
-    global livethreads
-    livethreads = livethreads - 1
-    
-
-tcp = ThreadedConnectionPool(1, max_concurrency * 10, DSN)
+#tcp = ThreadedConnectionPool(1, max_concurrency + 8, DSN)
 
 pool = ThreadPoolExecutor(max_concurrency)
+
+futures = []
+for j in range(1, num_tables + 1):
+    futures.append(pool.submit(mk_table, j))
+    mythread = futures[-1]
+    mythread.add_done_callback(tabledone)
+    #print(str(datetime.datetime.now()) + ": Created thread for table #" + str(j).zfill(6) + ": " + str(mythread))
+print(str(datetime.datetime.now()) + " All threads queued to setup tables.")
+#for future in concurrent.futures.as_completed(futures):
+    #print(future.result())
+#    pass
+
+while True:
+    mypercent = 100 * mybatches / totalbatches
+    myduration = datetime.datetime.now() - starttime
+    if (mybatches):
+        expectedruntime = (myduration / (mybatches / totalbatches)) - myduration
+    else:
+        expectedruntime = "forever"
+    print(str(datetime.datetime.now()) + ": Thr.Done:" + str(str(futures).count('state=finished')) + " WIP:" + str(str(futures).count('state=running')) + " Queue:" + str(str(futures).count('state=pending')))
+    sleep(1)
+    if (str(futures).count('state=finished') == num_tables):
+        break
+
 
 futures = []
 for j in range(1, num_tables + 1):
@@ -170,7 +181,7 @@ for j in range(1, num_tables + 1):
     mythread = futures[-1]
     mythread.add_done_callback(tabledone)
     #print(str(datetime.datetime.now()) + ": Created thread for table #" + str(j).zfill(6) + ": " + str(mythread))
-print(str(datetime.datetime.now()) + " All threads created.")
+print(str(datetime.datetime.now()) + " All threads queued to create data.")
 #for future in concurrent.futures.as_completed(futures):
     #print(future.result())
 #    pass
@@ -180,10 +191,10 @@ while True:
     mypercent = 100 * mybatches / totalbatches
     myduration = datetime.datetime.now() - starttime
     if (mybatches):
-        expectedruntime = myduration / (mybatches / totalbatches)
+        expectedruntime = (myduration / (mybatches / totalbatches)) - myduration
     else:
         expectedruntime = "forever"
-    print(str(datetime.datetime.now()) + ": Threads finished: " + str(str(futures).count('state=finished')) + " Running: " + str(str(futures).count('state=running')) + " Pending: " + str(str(futures).count('state=pending')) + " Cancelled: " + str(str(futures).count('state=cancelled')) + " Exceptions: " + str(str(futures).count('state=exception')) + " Completed Batches: " + str(mybatches).zfill(6) + " " + str(mypercent) + "% " + str(myduration) + " " + str(expectedruntime))
+    print(str(datetime.datetime.now()) + ": Thr.Done:" + str(str(futures).count('state=finished')) + " WIP:" + str(str(futures).count('state=running')) + " Queue:" + str(str(futures).count('state=pending')) + " Batches done:" + str(mybatches).zfill(6) + " RT:" + str(myduration) + " Remaining:" + str(expectedruntime) + " " + str(mypercent) + "%")
     sleep(1)
     if (str(futures).count('state=finished') == num_tables):
         break
