@@ -8,7 +8,8 @@ ToDo:
 * use both multiprocess and multithread approaches - 400 threads doesn't scale well
 * have the --init build a queue of work
 * have the --run spawn multiple processes with multiple threads each
-* have the --run be aware of read amplification.  Back off if it goes above 10.
+* adjust load from read amplification - SELECT max(metrics->'rocksdb.read-amplification') FROM crdb_internal.kv_store_status
+* adjust load by transaction duration - select * from crdb_internal.node_metrics where name = 'sql.txn.latency-p99
 * get rid of connection pooling
 
 My notes for updating VMs:
