@@ -11,6 +11,8 @@ ToDo:
 * adjust load from read amplification - SELECT max(metrics->'rocksdb.read-amplification') FROM crdb_internal.kv_store_status
 * adjust load by transaction duration - select * from crdb_internal.node_metrics where name = 'sql.txn.latency-p99
 * get rid of connection pooling
+* use upserts for when restarts are needed
+* add a heartbeat ts for each batch
 
 My notes for updating VMs:
 ```
