@@ -11,12 +11,14 @@ from concurrent import futures
 import concurrent
 import time
 import logging
+import socket
+import os
 import argparse
 import math
 from psycopg2.pool import ThreadedConnectionPool
 
 parser = argparse.ArgumentParser()
-parser.add_argument("command", help="init, create, run, or cleanup; init slices up the work to be done and keeps it in a table in the db; create constructs the needed tables in the db; run does the data load; cleanup removes the config table that held the job definitions created by init")
+parser.add_argument("command", help="init, run, watch, or cleanup; init slices up the work to be done and keeps it in a table in the db and creates the destination tables; run does the data load and you can have multiple processes running at once; watch allows you to monitor the state of the batch queue; cleanup removes the config table that held the job definitions created by init")
 parser.add_argument("--pgurl", help="pgurl to use to connect to the db; ex. postgres://user@server:port/db?sslmode=disable")
 parser.add_argument("--threads", type=int, default=1, help="how many threads should be started? default:1")
 parser.add_argument("--numtables", type=int, default=1, help="number of tables to create; default=1")
@@ -36,7 +38,7 @@ totalbatches = args.numtables * args.numrows / args.insertsize
 def mk_table(table_id, tcp, numfields):
     
     #build a table sql
-    myquery = "CREATE TABLE IF NOT EXISTS table" + str(table_id).zfill(6) + " (field1 UUID PRIMARY KEY default gen_random_uuid(), field000002 INT"
+    myquery = "CREATE TABLE IF NOT EXISTS table" + str(table_id).zfill(6) + " (field000001 UUID PRIMARY KEY default gen_random_uuid(), field000002 INT"
     for i in range(1, numfields - 2 + 1):
         fieldnum = i + 2
         myquery = myquery + ", field" + str(fieldnum).zfill(6) + " INT"
@@ -65,7 +67,7 @@ def write_table(table_id, tcp, numrows, numfields, insertsize):
     conn2.autocommit = True
     cursor2 = conn2.cursor()
     
-    for j in range(1, numrows + 1):
+    for j in range(1, numrows +1):
         if (((j-1) % insertsize) == 0):
             myquery = "INSERT INTO table" + str(table_id).zfill(6) + " (field000002"
             for i in range(1, numfields - 2 + 1):
@@ -95,6 +97,41 @@ def write_table(table_id, tcp, numrows, numfields, insertsize):
             else:
                 conn2.commit()
     teardown(cursor2, conn2, tcp)
+
+def write_batch(tcp, mytable, startval, endval, numfields, seed, insertsize, batchid):
+    conn = tcp.getconn()
+    conn.autocommit = True
+    cursor = conn.cursor()
+
+    mystartval = startval
+    myendval = startval + insertsize
+    loops = round((endval-startval)/insertsize)
+    i = 1 # number of statements
+    while (i <= loops):
+        myquery = "INSERT INTO " + str(mytable) + " (field000002"
+        for j in range(3, numfields+1):
+            myquery = myquery + ", field" + str(j).zfill(6)
+        myquery = myquery +  ") VALUES"
+
+        myquery = myquery + "('" + str(mystartval) + "'"
+        for j in range(3, numfields+1):
+            myquery = myquery + ", '" + str(seed) + "'"
+        myquery = myquery + ")"
+        for k in range(mystartval+1, myendval):
+            myquery = myquery + ", ('" + str(k) + "'"
+            for j in range(3, numfields+1):
+                myquery = myquery + ", '" + str(seed) + "'"
+            myquery = myquery + ")"
+        myquery = myquery + ";"
+        cursor.execute(str(myquery))
+        mystartval = myendval + 1
+        myendval = myendval + insertsize
+        i += 1
+
+    ts = datetime.datetime.now()
+    myquery = "UPDATE datagen SET ts_end = '" + str(ts) + "' WHERE id = '" + str(batchid) + "' limit 1;"
+    cursor.execute(str(myquery))
+    teardown(cursor, conn, tcp)
 
 #tear down a connect and return it to the pool
 def teardown(cursor, conn, tcp):
@@ -165,8 +202,43 @@ def runtest(pool, tcp, starttime, numtables, numrows, numfields, insertsize):
         if (str(futures).count('state=finished') == args.numtables):
             break
 
-def workbatches(pool, tcp, starttime):
-    pass
+def workbatches(pool, tcp, starttime, maxthreads):
+    futures = []
+    mymaxthreadcount = maxthreads
+
+    worktobedone = 1
+    while worktobedone:
+        if str(futures).count('state=running') < mymaxthreadcount:
+            #get the next batch
+            conn = tcp.getconn()
+            conn.autocommit = True
+            cursor = conn.cursor()
+            hostname = socket.gethostname()
+            pid = os.getpid()
+            ts = datetime.datetime.now()
+            myquery = "update datagen set workerid = '" + str(hostname) + ":" + str(pid) + "', ts_start = '" + str(ts) + "' WHERE ts_start is null limit 1 returning id, mytable, startval, endval, numfields, seed, insertsize;"
+            cursor.execute(str(myquery))
+            row = cursor.fetchone()
+            teardown(cursor,conn,tcp)
+            # we have now checked out a batch of work, the tuple 'row' now has the important details in it to do work
+            futures.append(pool.submit(write_batch, tcp, row[1], row[2], row[3], row[4], row[5], row[6], row[0]))
+            mythread = futures[-1]
+            mythread.add_done_callback(tabledone)
+
+def dropitall(tcp):
+    myquery = "USE defaultdb; DROP database test cascade; create database test;"
+    conn = tcp.getconn()
+    conn.autocommit = True
+    cursor = conn.cursor()
+
+    try:    
+        cursor.execute(str(myquery))
+    except Exception as err:
+        print("ERROR: " + str(myquery) + " " + str(err))
+        conn.rollback()
+    else:       
+        conn.commit()
+    teardown(cursor, conn, tcp)
 
 def initcleanup(tcp):
     myquery = "DROP TABLE datagen;"
@@ -183,8 +255,8 @@ def initcleanup(tcp):
         conn.commit()
     teardown(cursor, conn, tcp)
 
-def inittest(pool, tcp, numtables, numrows, insertsize, batchsize):
-    myquery = "CREATE TABLE IF NOT EXISTS datagen (uuid UUID PRIMARY KEY default gen_random_uuid(), sequence INT, mytable string, startval int, endval int, seed int, insertsize int, ts_start timestamp, ts_heartbeat timestamp, ts_end timestamp);"
+def inittest(pool, tcp, numtables, numrows, insertsize, batchsize, numfields):
+    myquery = "CREATE TABLE IF NOT EXISTS datagen (id UUID PRIMARY KEY default gen_random_uuid(), sequence INT, mytable string, startval int, endval int, numfields int, seed int, insertsize int, workerid string, ts_start timestamp, ts_heartbeat timestamp, ts_end timestamp);"
     conn = tcp.getconn()
     conn.autocommit = True
     cursor = conn.cursor()
@@ -208,7 +280,7 @@ def inittest(pool, tcp, numtables, numrows, insertsize, batchsize):
         conn.commit()
 
     #build all the work chunks in the db.
-    numbatchespertbl = math.ceil(numrows/insertsize/batchsize)
+    numbatchespertbl = math.ceil(numrows/batchsize)
   
     conn = tcp.getconn()
     conn.autocommit = True
@@ -216,18 +288,39 @@ def inittest(pool, tcp, numtables, numrows, insertsize, batchsize):
     
     seq = 1
     for t in range(1,numtables+1):
-        myquery = "INSERT INTO datagen (sequence, mytable, startval, endval, seed, insertsize) VALUES "
+        myquery = "INSERT INTO datagen (sequence, mytable, startval, endval, seed, insertsize, numfields) VALUES "
         for i in range(1,numbatchespertbl+1):
             seed = random.randint(1,99999999)
             start = 1 + (batchsize * (i-1))
             end = i * batchsize
-            myquery = myquery + "(" + str(seq) + ", 'table" + str(t).zfill(6) + "', " + str(start) + ", " + str(end) + ", " + str(seed) + ", " + str(insertsize) + ")"
+            myquery = myquery + "(" + str(seq) + ", 'table" + str(t).zfill(6) + "', " + str(start) + ", " + str(end) + ", " + str(seed) + ", " + str(insertsize) + ", " + str(numfields) + ")"
             if (i < numbatchespertbl):
                 myquery = myquery + ", "
             seq = seq + 1
         cursor.execute(str(myquery))
         conn.commit()
     teardown(cursor, conn, tcp)
+    createtables(pool, tcp, numtables, numfields)
+
+def watch(tcp):
+    conn = tcp.getconn()
+    conn.autocommit = True
+    cursor = conn.cursor()
+    while True:
+        myquery = "SELECT count(*) from datagen;"
+        cursor.execute(str(myquery))
+        totalbatches = cursor.fetchone()[0]
+        myquery = "SELECT count(*) from datagen where ts_end is not null;"
+        cursor.execute(str(myquery))
+        done = cursor.fetchone()[0]
+        myquery = "SELECT count(*) from datagen where ts_end is null and ts_start is not null;"
+        cursor.execute(str(myquery))
+        wip = cursor.fetchone()[0]
+        remaining = totalbatches - wip - done
+        print(str(datetime.datetime.now()) + " Batches: " + str(totalbatches) + "; Done: " + str(done) + "; WIP: " + str(wip) + "; Remaining: " + str(remaining))
+        if (done == totalbatches):
+            break
+        sleep(2)
 
 def main():
     starttime = datetime.datetime.now()
@@ -244,19 +337,24 @@ def main():
         return 1
 
     tcp = ThreadedConnectionPool(1, args.threads + 8, args.pgurl)
-    pool = ThreadPoolExecutor(args.threads)
+    pool = ThreadPoolExecutor(args.threads+4)
 
     if (args.command == "create"):
         createtables(pool, tcp, args.numtables, args.numfields)
-    elif (args.command == "run"):
+    elif (args.command == "oldrun"):
         runtest(pool, tcp, starttime, args.numtables, args.numrows, args.numfields, args.insertsize)
     elif (args.command == "init"):
-        inittest(pool, tcp, args.numtables, args.numrows, args.insertsize, args.batchsize)
-    elif (args.command == "workbatches"):
-        workbatches(pool, tcp, starttime)
+        inittest(pool, tcp, args.numtables, args.numrows, args.insertsize, args.batchsize, args.numfields)
+    elif (args.command == "run"):
+        workbatches(pool, tcp, starttime, args.threads)
     elif (args.command == "cleanup"):
         initcleanup(tcp)
+    elif (args.command == "drop"):
+        dropitall(tcp)
+    elif (args.command == "watch"):
+        watch(tcp)
 
+    pool.shutdown(wait=True)
     print("Runtime of " + str(datetime.datetime.now() - starttime))
 
 if __name__ == "__main__":
