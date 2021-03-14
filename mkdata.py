@@ -24,7 +24,7 @@ parser.add_argument("--threads", type=int, default=1, help="how many threads sho
 parser.add_argument("--numtables", type=int, default=1, help="number of tables to create; default=1")
 parser.add_argument("--numfields", type=int, default=2, help="number of fields to create in each table, min of 2; deafult=2")
 parser.add_argument("--numrows", type=int, default=1000, help="number of rows to create in each table; default=1k")
-parser.add_argument("--insertsize", type=int, default=1, help="number of inserts to do in a single query; default=1")
+parser.add_argument("--insertsize", type=int, default=100, help="number of inserts to do in a single query; default=100")
 parser.add_argument("--batchsize", type=int, default=1000, help="number of queries to be part of each batch of work; default:1k")
 
 args = parser.parse_args()
@@ -106,9 +106,10 @@ def write_batch(tcp, mytable, startval, endval, numfields, seed, insertsize, bat
     mystartval = startval
     myendval = startval + insertsize
     loops = round((endval-startval)/insertsize)
+    mylastheartbeat = datetime.datetime.now()
     i = 1 # number of statements
     while (i <= loops):
-        myquery = "INSERT INTO " + str(mytable) + " (field000002"
+        myquery = "UPSERT INTO " + str(mytable) + " (field000002"
         for j in range(3, numfields+1):
             myquery = myquery + ", field" + str(j).zfill(6)
         myquery = myquery +  ") VALUES"
@@ -126,6 +127,10 @@ def write_batch(tcp, mytable, startval, endval, numfields, seed, insertsize, bat
         cursor.execute(str(myquery))
         mystartval = myendval + 1
         myendval = myendval + insertsize
+        if ( datetime.datetime.now() > mylastheartbeat + datetime.timedelta(seconds=10) ):
+            mylastheartbeat = datetime.datetime.now()
+            myquery = "UPDATE datagen set ts_heartbeat = '" + str(mylastheartbeat) + "' WHERE id = '" + str(batchid) + "' limit 1;"
+            cursor.execute(str(myquery))
         i += 1
 
     ts = datetime.datetime.now()
@@ -220,6 +225,8 @@ def workbatches(pool, tcp, starttime, maxthreads):
             cursor.execute(str(myquery))
             row = cursor.fetchone()
             teardown(cursor,conn,tcp)
+            if row is None:
+                break
             # we have now checked out a batch of work, the tuple 'row' now has the important details in it to do work
             futures.append(pool.submit(write_batch, tcp, row[1], row[2], row[3], row[4], row[5], row[6], row[0]))
             mythread = futures[-1]
@@ -306,6 +313,7 @@ def watch(tcp):
     conn = tcp.getconn()
     conn.autocommit = True
     cursor = conn.cursor()
+    mylastcleanup = datetime.datetime.now()
     while True:
         myquery = "SELECT count(*) from datagen;"
         cursor.execute(str(myquery))
@@ -320,6 +328,13 @@ def watch(tcp):
         print(str(datetime.datetime.now()) + " Batches: " + str(totalbatches) + "; Done: " + str(done) + "; WIP: " + str(wip) + "; Remaining: " + str(remaining))
         if (done == totalbatches):
             break
+        if ( datetime.datetime.now() > mylastcleanup + datetime.timedelta(seconds=60) ):
+            mylastcleanup = datetime.datetime.now()
+            oldts = datetime.datetime.now() - datetime.timedelta(seconds=120)
+            myquery = "UPDATE datagen set ts_heartbeat = NULL, ts_start = NULL WHERE ts_end is null and ( ts_heartbeat < '" + str(oldts) + "' OR ts_heartbeat is null ) ;"
+            result = cursor.fetchone()
+            print("I tried to reset some stale batches back to new so they could be worked. " + str(result))
+            cursor.execute(str(myquery))
         sleep(2)
 
 def main():
