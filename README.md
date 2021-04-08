@@ -3,7 +3,7 @@ A data creation and simulation tool for CockroachDB
 
 ToDo:
 * clean everything up 
-* turn all queries into parameterized execution
+* turn all queries into prepared parameterized sql
 * turn stuff into functions/methods
 * DONE: separate table creation into separate threads
 * DONE: use both multiprocess and multithread approaches - 400 threads doesn't scale well
