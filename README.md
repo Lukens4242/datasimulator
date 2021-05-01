@@ -3,6 +3,7 @@ A data creation and simulation tool for CockroachDB
 
 ToDo:
 * clean everything up 
+* put pgsql into binary mode instead of simple
 * turn all queries into prepared parameterized sql
 * turn stuff into functions/methods
 * DONE: separate table creation into separate threads
