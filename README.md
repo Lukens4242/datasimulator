@@ -6,6 +6,7 @@ ToDo:
 * put pgsql into binary mode instead of simple
 * turn all queries into prepared parameterized sql
 * turn stuff into functions/methods
+* add a checkpoint beside the ts_heartbeat
 * DONE: separate table creation into separate threads
 * DONE: use both multiprocess and multithread approaches - 400 threads doesn't scale well
 * DONE: have the --init build a queue of work
